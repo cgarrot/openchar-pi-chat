@@ -44,6 +44,7 @@ fi
 
 step "4/4 Démarrage de Core (http://127.0.0.1:$PORT)"
 cd "$OPENCHAR_DIR/core"
+export INLINE_RUN_WORKERS="${INLINE_RUN_WORKERS:-3}"
 export INLINE_FRONTEND_ROOT="$OPENCHAR_DIR/dist-web"
 nohup bash webui.sh > /tmp/openchar-webui.log 2>&1 &
 echo "attente du serveur…"
