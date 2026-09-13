@@ -95,6 +95,54 @@ function audit(channel: string, args: unknown[]): void {
 
 const AUDIT_FILE = path.join(os.homedir(), ".pi", "openchar-audit.jsonl");
 
+/** Resolve an item id: exact match, or a unique prefix (the compact list shows 8 chars). */
+async function resolveItemId(prefix: string): Promise<string> {
+  const board = await rpc<any>("moodboard:list");
+  const items: any[] = board?.items || [];
+  const id = String(prefix).trim();
+  const exact = items.find((i) => i.id === id);
+  if (exact) return exact.id;
+  const matches = items.filter((i) => String(i.id).startsWith(id));
+  if (matches.length === 1) return matches[0].id;
+  if (matches.length > 1) {
+    throw new Error(`Préfixe ambigu (${matches.length} items) — donne plus de caractères.`);
+  }
+  throw new Error(`Item ${id} introuvable — ids via graph_list_nodes.`);
+}
+
+let coreOutputsCache: Record<string, string> | null = null;
+let coreInputsCache: Record<string, Array<{ id: string; kind: string }>> | null = null;
+
+/** A core node's declared input ports (for handle auto-fill). */
+async function coreInputs(coreType: string): Promise<Array<{ id: string; kind: string }>> {
+  if (!coreInputsCache) {
+    const models = await rpc<any>("core:models");
+    coreInputsCache = {};
+    for (const m of models?.models || []) {
+      coreInputsCache[m.type] = (m.inputs || []).map((i: any) => ({ id: i.id, kind: i.kind }));
+    }
+  }
+  return coreInputsCache[coreType] ?? [];
+}
+
+/** A core item's first output port id — connectors MUST carry it as sourceHandle, or the
+ * workflow builder names an output that does not exist and the wire resolves to nothing. */
+async function defaultSourceHandle(fromId: string): Promise<string | null> {
+  const board = await rpc<any>("moodboard:list");
+  const source = (board?.items || []).find((i: any) => i.id === fromId);
+  if (!source || source.type !== "core") return null; // prompts/assets are handled by the builder
+  if (!coreOutputsCache) {
+    const models = await rpc<any>("core:models");
+    coreOutputsCache = {};
+    for (const m of models?.models || []) {
+      const out = (m.outputs || [])[0];
+      if (out?.id) coreOutputsCache[m.type] = out.id;
+    }
+  }
+  const coreType = source?.data?.core?.type;
+  return (coreType && coreOutputsCache[coreType]) || null;
+}
+
 const ok = (text: string) => ({
   content: [{ type: "text" as const, text }],
   details: {},
@@ -289,8 +337,24 @@ export default function (pi: ExtensionAPI) {
       targetHandle: Type.Optional(Type.String({})),
     }),
     async execute(_id, p) {
+      const from = await resolveItemId(p.from);
+      const to = await resolveItemId(p.to);
+      // Auto-fill the source handle for core sources: without it the builder resolves the wire
+      // to a non-existent output and downstream nodes see zero inputs.
+      const sourceHandle = p.sourceHandle ?? (await defaultSourceHandle(from));
+      // Auto-fill the target handle too: a core target with exactly one text input (the usual
+      // prompt→generator wire) should not need an explicit handle — a missing one once sent
+      // six runs to a non-existent "in" port before the agent noticed.
+      let targetHandle = p.targetHandle ?? null;
+      const board = await rpc<any>("moodboard:list");
+      const toItem = (board?.items || []).find((i: any) => i.id === to);
+      const toCore = toItem?.data?.core?.type;
+      if (!targetHandle && toCore) {
+        const textPorts = (await coreInputs(toCore)).filter((port) => port.kind === "text");
+        if (textPorts.length === 1) targetHandle = textPorts[0].id;
+      }
       const c = await rpc<any>(
-        "moodboard:createConnector", p.from, p.to, p.sourceHandle ?? null, p.targetHandle ?? null,
+        "moodboard:createConnector", from, to, sourceHandle, targetHandle,
       );
       return ok(`Connecteur créé: ${JSON.stringify(c)}`);
     },
@@ -312,8 +376,9 @@ export default function (pi: ExtensionAPI) {
       promptText: Type.Optional(Type.String({ description: "texte d'un item prompt" })),
     }),
     async execute(_id, p) {
+      const itemId = await resolveItemId(p.itemId);
       const board = await rpc<any>("moodboard:list");
-      const item = (board?.items || []).find((i: any) => i.id === p.itemId);
+      const item = (board?.items || []).find((i: any) => i.id === itemId);
       if (!item) throw new Error(`Aucun item ${p.itemId} — ids via graph_list_nodes.`);
       const data = JSON.parse(JSON.stringify(item.data || {}));
       if (p.params && data.core) data.core.params = { ...(data.core.params || {}), ...p.params };
@@ -321,7 +386,7 @@ export default function (pi: ExtensionAPI) {
       const patch: Record<string, unknown> = { data };
       if (p.x !== undefined) patch.x = p.x;
       if (p.y !== undefined) patch.y = p.y;
-      const updated = await rpc<any>("moodboard:updateItem", p.itemId, patch);
+      const updated = await rpc<any>("moodboard:updateItem", itemId, patch);
       return ok(`Item mis à jour: ${JSON.stringify(updated).slice(0, 800)}`);
     },
   });
@@ -340,7 +405,8 @@ export default function (pi: ExtensionAPI) {
         return ok(`Connecteur ${p.connectorId} supprimé.`);
       }
       if (p.itemId) {
-        await rpc("moodboard:deleteItem", p.itemId);
+        const itemId = await resolveItemId(p.itemId);
+        await rpc("moodboard:deleteItem", itemId);
         return ok(`Item ${p.itemId} supprimé.`);
       }
       throw new Error("itemId ou connectorId requis.");
@@ -352,14 +418,94 @@ export default function (pi: ExtensionAPI) {
     name: "graph_run",
     label: "Graph: run",
     description:
-      "Lance le rendu d'un node/fenêtre du canvas (même bouton que Run dans l'UI). " +
-      "Le rendu démarre côté serveur ; suivre via graph_list_nodes (historique des takes).",
+      "Lance le rendu d'un node. Le moteur exécute TOUTE sa chaîne amont dans l'ordre (études → " +
+      "fusion → vues), avec cache des nodes déjà rendus — donc lance le node FINAL pour dérouler " +
+      "la pipeline entière. Avec wait=true (défaut), attend que le rendu produise son take " +
+      "(jusqu'à timeout s) et renvoie les takes obtenus.",
     parameters: Type.Object({
       itemId: Type.String({ description: "id du node Core à rendre" }),
+      wait: Type.Optional(Type.Boolean({ description: "Attendre la fin du rendu (défaut true)" })),
+      timeout: Type.Optional(Type.Number({ description: "Attente max en secondes (défaut 600)" })),
+    }),
+    async execute(_id, p, signal) {
+      const outputsOf = (item: any): any[] =>
+        ((item?.data?.core?.outputs as any[]) ?? []).filter((o) => o && o.takeId);
+      const itemId = await resolveItemId(p.itemId);
+      const before = await rpc<any>("moodboard:list");
+      const target = (before?.items || []).find((i: any) => i.id === itemId);
+      if (!target) throw new Error(`Item ${p.itemId} introuvable.`);
+      const had = outputsOf(target).length;
+      await rpc("generation:runWorkflow", itemId);
+      if (p.wait === false) return ok(`Rendu lancé pour ${itemId}.`);
+      const deadline = Date.now() + (p.timeout ?? 600) * 1000;
+      while (Date.now() < deadline) {
+        // Abort-responsive: the user's Stop must interrupt a long wait immediately.
+        if (signal?.aborted) return ok(`Attente interrompue pour ${itemId} — le rendu continue côté serveur; re-vérifie avec graph_item_info.`);
+        await new Promise((r) => setTimeout(r, 5000));
+        if (signal?.aborted) return ok(`Attente interrompue pour ${itemId} — le rendu continue côté serveur.`);
+        const board = await rpc<any>("moodboard:list");
+        const item = (board?.items || []).find((i: any) => i.id === itemId);
+        const takes = outputsOf(item);
+        if (takes.length > had) {
+          return ok(
+            `Rendu terminé pour ${itemId} : ${takes.length} take(s) — plus récent: ${JSON.stringify(takes[0]).slice(0, 300)}`,
+          );
+        }
+        // échec visible ? l'historique d'activité porte les erreurs récentes
+        if (takes.length === had) {
+          try {
+            const history = await rpc<any[]>("activity:history", 6);
+            const failed = (Array.isArray(history) ? history : []).find(
+              (a: any) => (a?.itemId === itemId || a?.itemId?.startsWith?.(String(itemId).slice(0, 8))) && /error|fail/i.test(String(a?.status ?? a?.result ?? "")),
+            );
+            if (failed) {
+              return ok(
+                `ÉCHEC du rendu ${itemId} : ${JSON.stringify(failed).slice(0, 400)} — corrige (graph_update_node) puis relance.`,
+              );
+            }
+          } catch { /* activity optionnel */ }
+        }
+      }
+      return ok(
+        `Le rendu de ${itemId} tourne toujours après ${p.timeout ?? 600}s (takes: ${had}). ` +
+          `Re-vérifie avec graph_item_info.`,
+      );
+    },
+  });
+
+  pi.registerTool({
+    name: "graph_item_info",
+    label: "Graph: item info",
+    description:
+      "La fiche complète d'un item : type, params, prompt, connecteurs attachés et historique " +
+      "des takes produits (outputs). Sert à vérifier qu'un rendu a bien abouti.",
+    parameters: Type.Object({
+      itemId: Type.String({}),
     }),
     async execute(_id, p) {
-      await rpc("generation:runWorkflow", p.itemId);
-      return ok(`Rendu lancé pour ${p.itemId}.`);
+      const itemId = await resolveItemId(p.itemId);
+      const board = await rpc<any>("moodboard:list");
+      const item = (board?.items || []).find((i: any) => i.id === itemId);
+      if (!item) throw new Error(`Item ${p.itemId} introuvable.`);
+      const conns = (board?.connectors || []).filter(
+        (c: any) => c.fromItemId === itemId || c.toItemId === itemId,
+      );
+      return ok(JSON.stringify({ item, connectors: conns }, null, 1).slice(0, 8000));
+    },
+  });
+
+  pi.registerTool({
+    name: "activity_recent",
+    label: "Activity: recent",
+    description:
+      "Les runs récents (générations, entraînements) avec leur statut — la première chose à " +
+      "consulter quand un rendu échoue ou n'aboutit pas.",
+    parameters: Type.Object({
+      limit: Type.Optional(Type.Number({ description: "Nb d'entrées (défaut 10)" })),
+    }),
+    async execute(_id, p) {
+      const history = await rpc<any[]>("activity:history", p.limit ?? 10);
+      return ok(JSON.stringify(history, null, 1).slice(0, 6000));
     },
   });
 
