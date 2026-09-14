@@ -8,6 +8,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import * as fs from "node:fs";
+import { promises as fsp } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
@@ -205,6 +206,99 @@ export default function (pi: ExtensionAPI) {
       const entries = await nanogptCatalog(kind);
       const lines = entries.map((e) => `${e.id} — ${e.name ?? ""}`).join("\n");
       return ok(`${entries.length} modèles ${kind}:\n${lines}`);
+    },
+  });
+
+  // --- A4: routing capability -> modele (registry du KB x catalogue live) -------------------------
+  pi.registerTool({
+    name: "nanogpt_pick_model",
+    label: "NanoGPT: pick model",
+    description:
+      "Routage par CAPABILITY (pas par nom de modèle) : croise le capability registry du KB " +
+      "ai-film-knowledge (daté, corroboré — jamais de routage codé en dur) avec le catalogue " +
+      "NanoGPT live (disponibilité, prix, params). Ex: 'identity lock image-to-video', " +
+      "'precise camera motion', 'text on screen'. Renvoie les lignes du registry qui matchent + " +
+      "les modèles NanoGPT correspondants avec leur fiche courte.",
+    parameters: Type.Object({
+      capability: Type.String({ description: "Besoin en langage libre (ex: 'physics heavy motion')" }),
+      modality: Type.Optional(
+        Type.String({ description: "image | video — limite la recherche catalogue" }),
+      ),
+    }),
+    async execute(_id, p) {
+      const kb = process.env.AIFILM_KB || "/home/cgarrot/zob/ai-film-knowledge";
+      const registry = await fsp.readFile(`${kb}/models/capability-registry.md`, "utf8");
+      // lignes du tableau registry matchant la capability (insensible cas/sep)
+      const want = p.capability.toLowerCase().split(/[\s,]+/).filter((w) => w.length > 3);
+      const rows = registry
+        .split("\n")
+        .filter((l) => l.startsWith("| \\`"))
+        .filter((l) => {
+          const low = l.toLowerCase();
+          return want.some((w) => low.includes(w));
+        });
+      // modeles mentionnes -> verif presence + prix dans le catalogue
+      const mentioned = [...new Set(rows.flatMap((r) => r.split("|")[2]?.match(/[A-Za-z0-9.\- ]{3,}/g) ?? []))];
+      const modality = p.modality === "image" ? "image" : p.modality === "video" ? "video" : null;
+      const hits: string[] = [];
+      for (const kind of modality ? [modality] : ["image", "video"]) {
+        const entries = await nanogptCatalog(kind);
+        for (const e of entries) {
+          const id = String(e.id).toLowerCase();
+          const tokens = mentioned
+          .map((m) => m.toLowerCase().split(/[^a-z0-9.]/)[0])
+          .filter((t) => t.length >= 4);
+        if (tokens.some((t) => id.includes(t))) {
+            const price =
+              (e.pricing as any)?.per_image?.auto ?? (e.pricing as any)?.per_second ??
+              (e.pricing as any)?.minimum ?? "?";
+            hits.push(
+              `${e.id} [${kind}] ${String((e as any).name ?? "")} — prix indicatif: ${price}`,
+            );
+          }
+        }
+      }
+      return ok(
+        (rows.length
+          ? `Registry (${rows.length} lignes matchantes, datées + corroborées):\n${rows.join("\n")}`
+          : "Aucune ligne du registry ne matche — routing libre, appuie-toi sur le catalogue:") +
+          (hits.length ? `\n\nDisponibles sur NanoGPT:\n${[...new Set(hits)].slice(0, 10).join("\n")}` : "") +
+          "\n\n(Règle registry: re-vérifier la fiche modèle avant production.)",
+      );
+    },
+  });
+
+  // --- A8: alimentation automatique de l'EVIDENCE-LEDGER ------------------------------------------
+  pi.registerTool({
+    name: "ledger_record",
+    label: "KB: ledger record",
+    description:
+      "Enregistre un run dans l'EVIDENCE-LEDGER du KB ai-film-knowledge : chaque pipeline " +
+      "exécutée sur OpenChar (pattern mobilisé, modèle, outcome PASS/FAIL, QC) doit incrémenter " +
+      "la base — elle apprend de NOS runs, pas seulement des cases X. À appeler après chaque " +
+      "gate ou batch significatif.",
+    parameters: Type.Object({
+      pattern: Type.String({ description: "Pattern mobilisé (ex: carrier-assets, delta-editing)" }),
+      model: Type.String({ description: "Modèle utilisé (id NanoGPT)" }),
+      outcome: Type.String({ description: "PASS | FAIL | PARTIAL + une phrase (QC, coût...)" }),
+    }),
+    async execute(_id, p) {
+      const kb = process.env.AIFILM_KB || "/home/cgarrot/zob/ai-film-knowledge";
+      const path = `${kb}/EVIDENCE-LEDGER.md`;
+      let project = "";
+      try {
+        const cur = await rpc<any>("project:current");
+        project = cur?.name ?? "";
+      } catch {
+        /* sans projet ouvert */
+      }
+      const today = new Date().toISOString().slice(0, 10);
+      const line = `- ${today} | ${p.pattern} | ${p.model} | ${p.outcome} | openchar:${project || "?"}\n`;
+      let file = await fsp.readFile(path, "utf8");
+      const section = "## Runs OpenChar (auto)";
+      if (!file.includes(section)) file += `\n${section}\n\n`;
+      await fsp.writeFile(path, file.endsWith("\n") ? file + line : file + "\n" + line);
+      return ok(`Ledger mis à jour : ${line.trim()}`);
     },
   });
 

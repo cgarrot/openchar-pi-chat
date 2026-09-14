@@ -104,3 +104,27 @@ Itérer sur un rendu = **dupliquer la node** (même type/params, position décal
 **UNE seule variable** (prompt, ratio, modèle), re-render, comparer avec `take_qc`, garder le
 meilleur (pin) — l'essai rejeté reste dans l'historique de takes, rien ne se perd. Ne modifie
 JAMAIS la node validée elle-même : c'est l'esprit de l'experimental loop du KB.
+
+
+## Depuis le storyboard → execution-plan (A5)
+
+À la demande « crée la pipeline depuis le storyboard » :
+1. Lis le storyboard + la bible du projet (dossier trajectoire ou refs) ET les 4 mémoires
+   templates du KB (`projects/_template/*.yaml`) comme structure.
+2. Produis `<projet>/execution-plan.yaml` : étages G0→G4, par plan : carriers requis,
+   keyframe spec (prompt court), routing modèle PAR CAPABILITY (`nanogpt_pick_model`, jamais
+   un nom en dur), budget estimé (fiches modèles), critères QC par gate.
+3. Annonce le plan (résumé court) AVANT de construire — puis construis étage par étage.
+
+## QC systématique post-batch (A6)
+
+Après chaque batch de rendus (étage G1 keyframes, G3 vidéos) : QC automatique —
+`take_qc(grid="identity" ou "motion")` sur CHAQUE take (première frame pour les vidéos),
+rapport condensé à l'utilisateur, verdicts consignés dans `film-memory.yaml`, et
+`ledger_record(pattern, model, outcome)` pour chaque pattern mobilisé. Un FAIL = delta-edit
+du node fautif seul.
+
+## Ledger (A8)
+
+Chaque run significatif alimente l'EVIDENCE-LEDGER via `ledger_record` — la base apprend de
+nos pipelines (corroboration interne), pas seulement des cases externes.
