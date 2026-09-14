@@ -561,8 +561,10 @@ ${lines.join("\n")}
           i.type === "prompt" && data.promptText
             ? ` text=${String(data.promptText).slice(0, 60)}`
             : Array.isArray(data.assetIds) && data.assetIds.length
-              ? ` assets=${(data.assetIds as string[]).map(short).join(",")}`
-              : "";
+              ? `${data.name ? ` "${String(data.name)}"` : ""} assets=${(data.assetIds as string[]).map(short).join(",")}`
+              : data.name
+                ? ` "${String(data.name)}"`
+                : "";
         return `${short(i.id)} ${core.type ?? i.type} @(${Math.round(i.x)},${Math.round(i.y)})${
           brief ? ` ${brief}` : ""
         }${extra}`;
@@ -679,6 +681,7 @@ ${lines.join("\n")}
       y: Type.Optional(Type.Number({})),
       params: Type.Optional(Type.Record(Type.String(), Type.Any(), { description: "params à fusionner dans data.core.params" })),
       promptText: Type.Optional(Type.String({ description: "texte d'un item prompt" })),
+      name: Type.Optional(Type.String({ description: "nom lisible de l'item (ex: 'Master Rue', 'Sheet Mathieu') — affiché sur la node et dans les listings" })),
     }),
     async execute(_id, p) {
       const itemId = await resolveItemId(p.itemId);
@@ -688,6 +691,7 @@ ${lines.join("\n")}
       const data = JSON.parse(JSON.stringify(item.data || {}));
       if (p.params && data.core) data.core.params = { ...(data.core.params || {}), ...p.params };
       if (p.promptText !== undefined) data.promptText = p.promptText;
+      if (p.name !== undefined && p.name !== "") data.name = String(p.name);
       const patch: Record<string, unknown> = { data };
       if (p.x !== undefined) patch.x = p.x;
       if (p.y !== undefined) patch.y = p.y;
