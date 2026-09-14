@@ -58,3 +58,26 @@ déjà rendus). Donc :
   construire, puis construis et exécute.
 - **Attente** : préfère la vérification par `graph_item_info` après un `sleep` bash plutôt
   que des re-runs ; les rendus d'un même étage peuvent tourner en parallèle côté serveur.
+
+
+## Gates de validation (G0→G4) — process linéaire
+
+- **G0** masters validés (take_qc contre les blocs bible) → **épingler** (`graph_pin_take`) :
+  une node épinglée ne se re-rend jamais, c'est la gate.
+- **G1** keyframes : take_qc une par une (façades, identité, tenue, continuité). FAIL =
+  delta-edit du node fautif SEUL, jamais des voisines. Valide → épingler.
+- **G2** vidéo pilote sur LE plan le plus dur, rendue seule, regardée entière, UNE variable
+  changée par itération.
+- **G3** batch des autres (un seul passage, tout est câblé et les amonts épinglés sont gelés).
+- **G4** QC des clips → `graph_export_clips()` pour générer le CLIPS= du script de montage.
+
+## Règles satellites
+
+- `generate_audio` : le DÉFAUT du modèle est true (coût + voix parasite). Ne l'active que si
+  la bible le demande explicitement (sound design en post = OFF).
+- Vidéo `seedance-2.5` / `-turbo` : pas de seed côté API (seul `-spicy` en a un) — la
+  reproductibilité passe par le verrou d'image de départ (keyframe épinglée).
+- Multi-identités (minute 2+) : préférer les nodes character/* (encode + verify-refs + .char)
+  aux sheets ré-injectées — à tester d'abord sur un personnage.
+- Range le board par étages (moodboard:addLayer « G0-Masters », « G1-Keyframes », …) : la
+  linéarité doit se VOIR.

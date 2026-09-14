@@ -208,6 +208,144 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // --- epinglage de take (gate de validation) ----------------------------------------------------
+  pi.registerTool({
+    name: "graph_pin_take",
+    label: "Graph: pin take",
+    description:
+      "Épingle UN take précis comme sortie officielle de la node : les nodes aval le " +
+      "consomment, et la node épinglée NE SE RE-REND JAMAIS (même si on la relance) — c'est la " +
+      "gate de validation « un étage validé ne se re-rend jamais ». Prends les takeId via " +
+      "graph_item_info (outputs[].takeId).",
+    parameters: Type.Object({
+      itemId: Type.String({ description: "id (ou préfixe) de la node" }),
+      takeId: Type.String({ description: "takeId à épingler" }),
+    }),
+    async execute(_id, p) {
+      const itemId = await resolveItemId(p.itemId);
+      const board = await rpc<any>("moodboard:list");
+      const item = (board?.items || []).find((i: any) => i.id === itemId);
+      const outputs = item?.data?.core?.outputs || [];
+      if (!outputs.some((o: any) => o.takeId === p.takeId)) {
+        throw new Error(`takeId ${p.takeId} introuvable sur la node — ids via graph_item_info.`);
+      }
+      const updated = await rpc<any>("moodboard:updateItem", itemId, {
+        data: { ...item.data, core: { ...item.data.core, pinnedTakeId: p.takeId } },
+      });
+      return ok(`Take ${p.takeId} épinglé sur ${p.itemId}: la node est validée et ne se re-rend plus.`);
+    },
+  });
+
+  pi.registerTool({
+    name: "graph_unpin_take",
+    label: "Graph: unpin take",
+    description:
+      "Retire l'épinglage : la node redevient re-renderable et son dernier take redevient la sortie.",
+    parameters: Type.Object({ itemId: Type.String({}) }),
+    async execute(_id, p) {
+      const itemId = await resolveItemId(p.itemId);
+      const board = await rpc<any>("moodboard:list");
+      const item = (board?.items || []).find((i: any) => i.id === itemId);
+      if (!item?.data?.core) throw new Error(`Node ${p.itemId} introuvable.`);
+      const updated = await rpc<any>("moodboard:updateItem", itemId, {
+        data: { ...item.data, core: { ...item.data.core, pinnedTakeId: null } },
+      });
+      return ok(`Épinglage retiré de ${p.itemId}.`);
+    },
+  });
+
+  // --- QC vision sur un take ----------------------------------------------------------------------
+  pi.registerTool({
+    name: "take_qc",
+    label: "Take: QC vision",
+    description:
+      "Analyse une image du canvas (take d'une node, ou chemin de fichier) avec un modèle vision " +
+      "NanoGPT : passe-la au crible d'une checklist (façades présentes ? identité du personnage ? " +
+      "tenue ? continuité ?). Sert aux gates G0 (masters), G1 (keyframes), G4 (frames vidéo en " +
+      "première image). Renvoie les constats en texte.",
+    parameters: Type.Object({
+      path: Type.String({ description: "Chemin du fichier image (ou exporté via graph_export_clips)" }),
+      checklist: Type.String({ description: "Points à vérifier, une ligne chacun" }),
+    }),
+    async execute(_id, p) {
+      const fs2 = await import("node:fs/promises");
+      const data = await fs2.readFile(p.path.replace(/^file:\/\//, ""));
+      const b64 = data.toString("base64");
+      const key = nanogptKey();
+      if (!key) return ok("Pas de clé NanoGPT — QC vision indisponible.");
+      // modèle vision : premier du catalogue texte détaillé acceptant des images en entrée
+      let model = process.env.NANOGPT_VISION_MODEL || "";
+      if (!model) {
+        const entries = await nanogptCatalog("text");
+        const vision = entries.find(
+          (e: any) => (e?.architecture?.input_modalities || []).includes("image"),
+        );
+        model = vision?.id || "openai/gpt-5.6-sol";
+      }
+      const res = await fetch(NANOGPT_BASE + "/v1/chat/completions", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${key}`, "content-type": "application/json" },
+        body: JSON.stringify({
+          model,
+          max_tokens: 900,
+          messages: [
+            {
+              role: "user",
+              content: [
+                {
+                  type: "text",
+                  text:
+                    "Tu es responsable qualité image d'un studio d'animation. Vérifie CHAQUE point " +
+                    "de la checklist contre l'image. Réponds point par point : PASS/FAIL + une " +
+                    "phrase de détail. Termine par un verdict GLOBAL PASS ou FAIL.\n\nChecklist:\n" +
+                    p.checklist,
+                },
+                { type: "image_url", image_url: { url: `data:image/png;base64,${b64}` } },
+              ],
+            },
+          ],
+        }),
+      });
+      if (!res.ok) return ok(`QC vision HTTP ${res.status} — ${(await res.text()).slice(0, 200)}`);
+      const body = (await res.json()) as any;
+      const text = body?.choices?.[0]?.message?.content;
+      return ok(`[QC vision — ${model}]
+${typeof text === "string" ? text : JSON.stringify(text)}`);
+    },
+  });
+
+  // --- export CLIPS pour le montage ----------------------------------------------------------------
+  pi.registerTool({
+    name: "graph_export_clips",
+    label: "Graph: export CLIPS",
+    description:
+      "Exporte les takes actifs du board en tableau shell CLIPS=(...) prêt à coller dans " +
+      "build_minute01.sh : une entrée par node génératrice (take épinglé sinon le dernier), " +
+      "triées par position canvas (gauche→droite, haut→bas).",
+    parameters: Type.Object({}),
+    async execute() {
+      const board = await rpc<any>("moodboard:list");
+      const items = (board?.items || [])
+        .filter((i: any) => i?.data?.core)
+        .map((i: any) => {
+          const outputs = i.data.core.outputs || [];
+          const pinned = i.data.core.pinnedTakeId;
+          const take =
+            outputs.find((o: any) => o.takeId === pinned) || outputs[0] || null;
+          return take ? { x: i.x, y: i.y, path: take.filePath, id: i.id } : null;
+        })
+        .filter(Boolean)
+        .sort((a: any, b: any) => a.x - b.x || a.y - b.y);
+      const base = process.env.OPENCHAR_PROJECT_DIR || "";
+      const lines = items.map(
+        (t: any) => `  "${base ? base + "/" : ""}${t.path}"  # ${t.id.slice(0, 8)}`,
+      );
+      return ok(`CLIPS=(
+${lines.join("\n")}
+)`);
+    },
+  });
+
   // --- auto-nommage de l'onglet ----------------------------------------------------------------
   pi.registerTool({
     name: "chat_set_title",
