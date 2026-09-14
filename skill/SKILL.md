@@ -81,3 +81,26 @@ déjà rendus). Donc :
   aux sheets ré-injectées — à tester d'abord sur un personnage.
 - Range le board par étages (moodboard:addLayer « G0-Masters », « G1-Keyframes », …) : la
   linéarité doit se VOIR.
+
+
+## Mémoire film par projet (A2)
+
+Chaque projet porte sa mémoire : `<chemin du projet>/film-memory.yaml` (le chemin est dans le
+tampon `[Projet actif : … — chemin]` de chaque message). Au premier message d'un projet :
+lis-la si elle existe. À chaque gate validée, décision prise, seed notable : mets-la à jour
+(états du film, carriers épinglés, routages, échecs retenus). C'est la mémoire longue que la
+session seule ne peut pas porter — elle survit aux chats.
+
+## Le canvas montre le process (A3)
+
+Range le board par étages visibles : crée un Layer par étage (`moodboard:addLayer`, renomme
+via `graph_update_node` → `data.name`) : « G0-Masters », « G1-Keyframes », « G2-Pilote »,
+« G3-Batch », « G4-QC » — et positionne-le autour des nodes de son étage (le layer est un
+rectangle ; ce qu'il entoure, c'est son contenu). La linéarité doit se VOIR sur le board.
+
+## Boucle expérimentale (A9)
+
+Itérer sur un rendu = **dupliquer la node** (même type/params, position décalée), changer
+**UNE seule variable** (prompt, ratio, modèle), re-render, comparer avec `take_qc`, garder le
+meilleur (pin) — l'essai rejeté reste dans l'historique de takes, rien ne se perd. Ne modifie
+JAMAIS la node validée elle-même : c'est l'esprit de l'experimental loop du KB.

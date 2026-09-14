@@ -255,21 +255,79 @@ export default function (pi: ExtensionAPI) {
   });
 
   // --- QC vision sur un take ----------------------------------------------------------------------
+  /** The canonical QC grids from the ai-film-knowledge repo (python3+PyYAML available). */
+  async function qcGrid(grid: string): Promise<string> {
+    const kb = process.env.AIFILM_KB || "/home/cgarrot/zob/ai-film-knowledge";
+    const { execFile } = await import("node:child_process");
+    const json = await new Promise<string>((resolve, reject) => {
+      execFile(
+        "python3",
+        [
+          "-c",
+          "import json,yaml,sys;d=yaml.safe_load(open(sys.argv[1]))['dimensions'].get(sys.argv[2]);" +
+            "print(json.dumps(d if d else None))",
+          `${kb}/tools/qc_checklists.yaml`,
+          grid,
+        ],
+        { timeout: 15000 },
+        (err, stdout) => (err ? reject(err) : resolve(stdout)),
+      );
+    });
+    const dim = JSON.parse(json || "null");
+    if (!dim) throw new Error(`Grille QC « ${grid} » introuvable (identity|motion|continuity|cinematic_quality).`);
+    const checks = (dim.checks || []) as Array<{ id?: string; q?: string; fail_if?: string }>;
+    return (
+      `[Grille canonique ${grid} — ${kb}]\n` +
+      checks.map((c) => `${c.id ?? "?"}: ${c.q ?? ""} (FAIL si: ${c.fail_if ?? "?"})`).join("\n")
+    );
+  }
+
   pi.registerTool({
     name: "take_qc",
     label: "Take: QC vision",
     description:
       "Analyse une image du canvas (take d'une node, ou chemin de fichier) avec un modèle vision " +
-      "NanoGPT : passe-la au crible d'une checklist (façades présentes ? identité du personnage ? " +
-      "tenue ? continuité ?). Sert aux gates G0 (masters), G1 (keyframes), G4 (frames vidéo en " +
-      "première image). Renvoie les constats en texte.",
+      "NanoGPT. Deux modes : grid= (grilles CANONIQUES du KB ai-film — identity, motion, " +
+      "continuity, cinematic_quality) ou checklist= (points libres). Sert aux gates G0 (masters), " +
+      "G1 (keyframes), G4 (premières frames vidéo). Renvoie PASS/FAIL point par point + verdict.",
     parameters: Type.Object({
-      path: Type.String({ description: "Chemin du fichier image (ou exporté via graph_export_clips)" }),
-      checklist: Type.String({ description: "Points à vérifier, une ligne chacun" }),
+      path: Type.String({ description: "Chemin du fichier image (ou via graph_export_clips)" }),
+      grid: Type.Optional(
+        Type.String({ description: "Grille canonique : identity | motion | continuity | cinematic_quality" }),
+      ),
+      checklist: Type.Optional(Type.String({ description: "Checklist libre (une ligne par point), si pas de grid" })),
     }),
     async execute(_id, p) {
+      const checklist = p.grid
+        ? await qcGrid(p.grid)
+        : (p.checklist ?? "").trim() || "(conformité générale à la référence)";
       const fs2 = await import("node:fs/promises");
-      const data = await fs2.readFile(p.path.replace(/^file:\/\//, ""));
+      const os2 = await import("node:os");
+      let imgPath = p.path.replace(/^file:\/\//, "");
+      let mime = "image/png";
+      // A 6 MB take PNG is an HTTP 413 at the vision endpoint: pre-shrink like the
+      // agent had to do by hand (ffmpeg scale → quality JPEG).
+      const stat = await fs2.stat(imgPath);
+      if (stat.size > 900_000) {
+        const tmp = `${os2.tmpdir()}/takeqc-${Date.now()}.jpg`;
+        const { execFile } = await import("node:child_process");
+        await new Promise<void>((resolve, reject) => {
+          execFile(
+            "ffmpeg",
+            ["-y", "-i", imgPath, "-vf", "scale='min(1536,iw)':-2", "-q:v", "5", tmp],
+            { timeout: 30000 },
+            (err) => (err ? reject(err) : resolve()),
+          );
+        }).catch(() => null); // best effort: on failure, send the original
+        try {
+          await fs2.access(tmp);
+          imgPath = tmp;
+          mime = "image/jpeg";
+        } catch {
+          /* garde l'original */
+        }
+      }
+      const data = await fs2.readFile(imgPath);
       const b64 = data.toString("base64");
       const key = nanogptKey();
       if (!key) return ok("Pas de clé NanoGPT — QC vision indisponible.");
@@ -277,10 +335,18 @@ export default function (pi: ExtensionAPI) {
       let model = process.env.NANOGPT_VISION_MODEL || "";
       if (!model) {
         const entries = await nanogptCatalog("text");
-        const vision = entries.find(
+        const withImage = entries.filter(
           (e: any) => (e?.architecture?.input_modalities || []).includes("image"),
         );
-        model = vision?.id || "openai/gpt-5.6-sol";
+        // Prefer a real vision-chat model over OCR/describer backends (LightOnOCR once
+        // auto-picked itself and answered with a scene description instead of the grid).
+        const prefer = [/^openai\//, /^google\//, /^anthropic\//, /(qwen|pixtral|llama)/i];
+        let chatLike: any;
+        for (const rx of prefer) {
+          chatLike = withImage.find((e: any) => rx.test(String(e.id)));
+          if (chatLike) break;
+        }
+        model = chatLike?.id || withImage[0]?.id || "openai/gpt-5.6-sol";
       }
       const res = await fetch(NANOGPT_BASE + "/v1/chat/completions", {
         method: "POST",
@@ -298,9 +364,9 @@ export default function (pi: ExtensionAPI) {
                     "Tu es responsable qualité image d'un studio d'animation. Vérifie CHAQUE point " +
                     "de la checklist contre l'image. Réponds point par point : PASS/FAIL + une " +
                     "phrase de détail. Termine par un verdict GLOBAL PASS ou FAIL.\n\nChecklist:\n" +
-                    p.checklist,
+                    checklist,
                 },
-                { type: "image_url", image_url: { url: `data:image/png;base64,${b64}` } },
+                { type: "image_url", image_url: { url: `data:${mime};base64,${b64}` } },
               ],
             },
           ],
@@ -308,9 +374,16 @@ export default function (pi: ExtensionAPI) {
       });
       if (!res.ok) return ok(`QC vision HTTP ${res.status} — ${(await res.text()).slice(0, 200)}`);
       const body = (await res.json()) as any;
-      const text = body?.choices?.[0]?.message?.content;
-      return ok(`[QC vision — ${model}]
-${typeof text === "string" ? text : JSON.stringify(text)}`);
+      const content = body?.choices?.[0]?.message?.content;
+      const text = Array.isArray(content)
+        ? content.map((b: any) => (b?.type === 'text' ? String(b.text ?? '') : '')).join('\n')
+        : String(content ?? '');
+      if (!text.trim()) {
+        return ok(
+          `[QC vision — ${model}] réponse vide. Corps: ${JSON.stringify(body).slice(0, 400)}`,
+        );
+      }
+      return ok(`[QC vision — ${model}]\n${text}`);
     },
   });
 
